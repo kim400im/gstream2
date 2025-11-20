@@ -1,0 +1,368 @@
+<!--
+  SPDX-FileCopyrightText: 2023 The Pion community <https://pion.ly>
+  SPDX-License-Identifier: MIT
+-->
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>WebRTC Sender</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 20px;
+            max-width: 1200px;
+        }
+        .section {
+            margin: 20px 0;
+            padding: 15px;
+            border: 1px solid #ccc;
+            border-radius: 5px;
+        }
+        button {
+            padding: 10px 20px;
+            margin: 5px;
+            cursor: pointer;
+            background-color: #4CAF50;
+            color: white;
+            border: none;
+            border-radius: 4px;
+        }
+        button:disabled {
+            background-color: #cccccc;
+            cursor: not-allowed;
+        }
+        video {
+            border: 1px solid #ddd;
+            margin: 5px;
+        }
+        .status {
+            padding: 10px;
+            margin: 10px 0;
+            border-radius: 4px;
+        }
+        .connected {
+            background-color: #d4edda;
+            color: #155724;
+        }
+        .disconnected {
+            background-color: #f8d7da;
+            color: #721c24;
+        }
+        .log-entry {
+            padding: 5px;
+            margin: 2px 0;
+            font-size: 12px;
+            font-family: monospace;
+        }
+        #logs {
+            max-height: 200px;
+            overflow-y: auto;
+            background-color: #f5f5f5;
+            padding: 10px;
+            border-radius: 4px;
+        }
+        select {
+            padding: 8px;
+            margin: 5px;
+            border-radius: 4px;
+            border: 1px solid #ccc;
+        }
+    </style>
+</head>
+<body>
+    <h1>WebRTC Sender (Browser)</h1>
+    
+    <div class="section">
+        <h2>Connection Status</h2>
+        <div id="status" class="status disconnected">
+            Disconnected from signaling server
+        </div>
+        <div id="peerStatus" class="status disconnected">
+            Not connected to receiver
+        </div>
+    </div>
+
+    <div class="section">
+        <h2>Available Receivers</h2>
+        <select id="receiverList" size="5" style="width: 100%; min-height: 80px;">
+            <option disabled>No receivers available</option>
+        </select>
+    </div>
+
+    <div class="section">
+        <h2>Media Controls</h2>
+        <button onclick="startCamera()" id="cameraBtn">Start Camera</button>
+        <button onclick="addDisplayCapture()" id="displayBtn" disabled>Add Screen Share</button>
+        <button onclick="connectToReceiver()" id="connectBtn" disabled>Connect to Selected Receiver</button>
+    </div>
+
+    <div class="section">
+        <h2>Local Video</h2>
+        <div id="localVideos"></div>
+    </div>
+
+    <div class="section">
+        <h2>Logs</h2>
+        <div id="logs"></div>
+    </div>
+
+    <script>
+        let ws;
+        let pc;
+        let myId = 'sender-' + Math.random().toString(36).substr(2, 9);
+        let selectedReceiver = null;
+
+        // WebSocket 연결
+        function connectWebSocket() {
+            ws = new WebSocket('ws://144.24.83.16:8080/ws');
+            
+            ws.onopen = () => {
+                log('Connected to signaling server');
+                updateStatus('connected');
+                
+                // 서버에 등록
+                ws.send(JSON.stringify({
+                    type: 'register',
+                    from: myId,
+                    role: 'sender'
+                }));
+            };
+            
+            ws.onmessage = (event) => {
+                const msg = JSON.parse(event.data);
+                handleSignalingMessage(msg);
+            };
+            
+            ws.onerror = (error) => {
+                log('WebSocket error: ' + error);
+            };
+            
+            ws.onclose = () => {
+                log('Disconnected from signaling server');
+                updateStatus('disconnected');
+                setTimeout(connectWebSocket, 3000); // 재연결 시도
+            };
+        }
+
+        // 시그널링 메시지 처리
+        function handleSignalingMessage(msg) {
+            log('Received: ' + msg.type);
+            
+            switch(msg.type) {
+                case 'registered':
+                    log('Successfully registered as: ' + myId);
+                    break;
+                    
+                case 'client-list':
+                    updateReceiverList(msg.payload);
+                    break;
+                    
+                case 'answer':
+                    handleAnswer(msg.payload);
+                    break;
+                    
+                case 'ice-candidate':
+                    handleIceCandidate(msg.payload);
+                    break;
+            }
+        }
+
+        // 수신자 목록 업데이트
+        function updateReceiverList(clients) {
+            const select = document.getElementById('receiverList');
+            select.innerHTML = '';
+            
+            let hasReceivers = false;
+            for (let [id, role] of Object.entries(clients)) {
+                if (role === 'receiver' && id !== myId) {
+                    const option = document.createElement('option');
+                    option.value = id;
+                    option.textContent = id;
+                    select.appendChild(option);
+                    hasReceivers = true;
+                }
+            }
+            
+            if (!hasReceivers) {
+                const option = document.createElement('option');
+                option.disabled = true;
+                option.textContent = 'No receivers available';
+                select.appendChild(option);
+            }
+            
+            document.getElementById('connectBtn').disabled = !hasReceivers || !pc;
+        }
+
+        // WebRTC 연결 초기화
+        function initPeerConnection() {
+            pc = new RTCPeerConnection({
+                iceServers: [
+                    { urls: 'stun:stun.l.google.com:19302' }
+                ]
+            });
+            
+            pc.onicecandidate = event => {
+                if (event.candidate && selectedReceiver) {
+                    ws.send(JSON.stringify({
+                        type: 'ice-candidate',
+                        from: myId,
+                        to: selectedReceiver,
+                        payload: event.candidate
+                    }));
+                }
+            };
+            
+            pc.oniceconnectionstatechange = () => {
+                log('ICE Connection State: ' + pc.iceConnectionState);
+                if (pc.iceConnectionState === 'connected') {
+                    updatePeerStatus('connected');
+                } else if (pc.iceConnectionState === 'disconnected' || pc.iceConnectionState === 'failed') {
+                    updatePeerStatus('disconnected');
+                }
+            };
+            
+            log('PeerConnection initialized');
+        }
+
+        // 카메라 시작
+        function startCamera() {
+            navigator.mediaDevices.getUserMedia({ video: true, audio: true })
+                .then(stream => {
+                    if (!pc) initPeerConnection();
+                    
+                    stream.getTracks().forEach(track => {
+                        pc.addTrack(track, stream);
+                    });
+                    
+                    displayVideo(stream);
+                    document.getElementById('displayBtn').disabled = false;
+                    document.getElementById('cameraBtn').disabled = true;
+                    document.getElementById('connectBtn').disabled = false;
+                    log('Camera started');
+                })
+                .catch(err => {
+                    log('Error accessing camera: ' + err);
+                });
+        }
+
+        // 화면 공유 추가
+        function addDisplayCapture() {
+            navigator.mediaDevices.getDisplayMedia({ video: true })
+                .then(stream => {
+                    stream.getTracks().forEach(track => {
+                        pc.addTrack(track, stream);
+                    });
+                    
+                    displayVideo(stream);
+                    document.getElementById('displayBtn').disabled = true;
+                    log('Screen sharing started');
+                })
+                .catch(err => {
+                    log('Error accessing screen: ' + err);
+                });
+        }
+
+        // 수신자에 연결
+        function connectToReceiver() {
+            const select = document.getElementById('receiverList');
+            selectedReceiver = select.value;
+            
+            if (!selectedReceiver) {
+                alert('Please select a receiver');
+                return;
+            }
+            
+            log('Creating offer for: ' + selectedReceiver);
+            
+            pc.createOffer()
+                .then(offer => pc.setLocalDescription(offer))
+                .then(() => {
+                    ws.send(JSON.stringify({
+                        type: 'offer',
+                        from: myId,
+                        to: selectedReceiver,
+                        payload: pc.localDescription
+                    }));
+                    log('Offer sent to ' + selectedReceiver);
+                })
+                .catch(err => {
+                    log('Error creating offer: ' + err);
+                });
+        }
+
+        // Answer 처리
+        function handleAnswer(answer) {
+            pc.setRemoteDescription(new RTCSessionDescription(answer))
+                .then(() => {
+                    log('Remote description set successfully');
+                })
+                .catch(err => {
+                    log('Error setting remote description: ' + err);
+                });
+        }
+
+        // ICE Candidate 처리
+        function handleIceCandidate(candidate) {
+            pc.addIceCandidate(new RTCIceCandidate(candidate))
+                .then(() => {
+                    log('ICE candidate added');
+                })
+                .catch(err => {
+                    log('Error adding ICE candidate: ' + err);
+                });
+        }
+
+        // 비디오 표시
+        function displayVideo(stream) {
+            const video = document.createElement('video');
+            video.srcObject = stream;
+            video.autoplay = true;
+            video.muted = true;
+            video.width = 320;
+            video.height = 240;
+            document.getElementById('localVideos').appendChild(video);
+        }
+
+        // 로그 출력
+        function log(msg) {
+            const logs = document.getElementById('logs');
+            const entry = document.createElement('div');
+            entry.className = 'log-entry';
+            const timestamp = new Date().toLocaleTimeString();
+            entry.textContent = `[${timestamp}] ${msg}`;
+            logs.appendChild(entry);
+            logs.scrollTop = logs.scrollHeight;
+            console.log(msg);
+        }
+
+        // 상태 업데이트
+        function updateStatus(status) {
+            const statusDiv = document.getElementById('status');
+            if (status === 'connected') {
+                statusDiv.className = 'status connected';
+                statusDiv.textContent = 'Connected to signaling server';
+            } else {
+                statusDiv.className = 'status disconnected';
+                statusDiv.textContent = 'Disconnected from signaling server';
+            }
+        }
+
+        function updatePeerStatus(status) {
+            const statusDiv = document.getElementById('peerStatus');
+            if (status === 'connected') {
+                statusDiv.className = 'status connected';
+                statusDiv.textContent = 'Connected to receiver - Streaming!';
+            } else {
+                statusDiv.className = 'status disconnected';
+                statusDiv.textContent = 'Not connected to receiver';
+            }
+        }
+
+        // 페이지 로드 시 WebSocket 연결
+        window.onload = () => {
+            connectWebSocket();
+        };
+    </script>
+</body>
+</html>
