@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/rand"
+	"net/http"
 	"runtime"
 	"strings"
 	"sync"
@@ -42,10 +43,17 @@ type VideoStats struct {
 	lastStatsTime   time.Time
 }
 
+// MJPEG 스트리밍을 위한 프레임 저장소
+type FrameStore struct {
+	sync.RWMutex
+	frame []byte
+}
+
 var (
-	ws   *websocket.Conn
-	pc   *webrtc.PeerConnection
-	myID string
+	ws         *websocket.Conn
+	pc         *webrtc.PeerConnection
+	myID       string
+	frameStore = &FrameStore{}
 )
 
 func init() {
@@ -61,6 +69,9 @@ func main() {
 
 	fmt.Printf("Starting receiver with ID: %s\n", myID)
 	fmt.Println("Connecting to signaling server at ws://144.24.83.16:8080/ws")
+
+	// HTTP 서버 시작 (MJPEG 스트리밍용)
+	go startHTTPServer()
 
 	// WebSocket 연결
 	var err error
@@ -96,6 +107,88 @@ func main() {
 		}
 
 		handleSignalingMessage(msg)
+	}
+}
+
+// HTTP 서버 시작
+func startHTTPServer() {
+	http.HandleFunc("/", handleViewer)
+	http.HandleFunc("/stream", handleStream)
+
+	fmt.Println("HTTP server started on :9000")
+	fmt.Println("Open http://localhost:9000 to view the stream")
+
+	if err := http.ListenAndServe(":9000", nil); err != nil {
+		fmt.Println("HTTP server error:", err)
+	}
+}
+
+// 뷰어 HTML 페이지
+func handleViewer(w http.ResponseWriter, r *http.Request) {
+	html := `<!DOCTYPE html>
+<html>
+<head>
+    <title>Receiver Viewer</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding: 20px;
+            background: #1a1a1a;
+            color: white;
+        }
+        h1 { margin-bottom: 20px; }
+        #stream {
+            max-width: 100%;
+            border: 2px solid #444;
+            border-radius: 8px;
+        }
+        .status {
+            margin-top: 10px;
+            padding: 10px;
+            background: #333;
+            border-radius: 4px;
+        }
+    </style>
+</head>
+<body>
+    <h1>Receiver Stream Viewer</h1>
+    <img id="stream" src="/stream" alt="Stream" />
+    <div class="status">
+        Streaming from GStreamer receiver
+    </div>
+</body>
+</html>`
+	w.Header().Set("Content-Type", "text/html")
+	w.Write([]byte(html))
+}
+
+// MJPEG 스트림 핸들러
+func handleStream(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+
+	for {
+		frameStore.RLock()
+		frame := frameStore.frame
+		frameStore.RUnlock()
+
+		if len(frame) > 0 {
+			fmt.Fprintf(w, "--frame\r\n")
+			fmt.Fprintf(w, "Content-Type: image/jpeg\r\n")
+			fmt.Fprintf(w, "Content-Length: %d\r\n\r\n", len(frame))
+			w.Write(frame)
+			fmt.Fprintf(w, "\r\n")
+
+			if flusher, ok := w.(http.Flusher); ok {
+				flusher.Flush()
+			}
+		}
+
+		time.Sleep(33 * time.Millisecond) // ~30fps
 	}
 }
 
@@ -145,7 +238,6 @@ func initPeerConnection() {
 					if _, _, rtcpErr := receiver.Read(rtcpBuf); rtcpErr != nil {
 						return
 					}
-					// RTCP 패킷 처리는 자동으로 WebRTC 내부에서 처리됨
 				}
 			}()
 
@@ -154,7 +246,34 @@ func initPeerConnection() {
 		}
 
 		// GStreamer 파이프라인 시작
-		appSrc := pipelineForCodec(track, codecName)
+		appSrc, appSink := pipelineForCodec(track, codecName)
+
+		// appsink에서 JPEG 프레임 읽기 (비디오인 경우)
+		if track.Kind() == webrtc.RTPCodecTypeVideo && appSink != nil {
+			go func() {
+				for {
+					sample := appSink.PullSample()
+					if sample == nil {
+						continue
+					}
+
+					buffer := sample.GetBuffer()
+					if buffer == nil {
+						continue
+					}
+
+					samples := buffer.Map(gst.MapRead)
+					if samples != nil {
+						frameStore.Lock()
+						frameStore.frame = make([]byte, len(samples.Bytes()))
+						copy(frameStore.frame, samples.Bytes())
+						frameStore.Unlock()
+						buffer.Unmap()
+					}
+				}
+			}()
+		}
+
 		buf := make([]byte, 1400)
 		for {
 			i, _, readErr := track.Read(buf)
@@ -338,23 +457,38 @@ func printStats(stats *VideoStats, receiver *webrtc.RTPReceiver) {
 	}
 }
 
-func pipelineForCodec(track *webrtc.TrackRemote, codecName string) *app.Source {
-	pipelineString := "appsrc format=time is-live=true do-timestamp=true name=src ! application/x-rtp"
+func pipelineForCodec(track *webrtc.TrackRemote, codecName string) (*app.Source, *app.Sink) {
+	var pipelineString string
+	var hasVideoSink bool
 
 	switch strings.ToLower(codecName) {
 	case "vp8":
-		pipelineString += fmt.Sprintf(", payload=%d, encoding-name=VP8-DRAFT-IETF-01 ! rtpvp8depay ! decodebin ! autovideosink", track.PayloadType())
+		// 비디오: JPEG 인코딩 후 appsink로 출력
+		pipelineString = fmt.Sprintf(
+			"appsrc format=time is-live=true do-timestamp=true name=src ! application/x-rtp, payload=%d, encoding-name=VP8-DRAFT-IETF-01 ! rtpvp8depay ! decodebin ! videoconvert ! video/x-raw,format=RGB ! jpegenc quality=85 ! appsink name=sink emit-signals=true sync=false",
+			track.PayloadType(),
+		)
+		hasVideoSink = true
 	case "opus":
-		pipelineString += fmt.Sprintf(", payload=%d, encoding-name=OPUS ! rtpopusdepay ! decodebin ! autoaudiosink", track.PayloadType())
+		pipelineString = fmt.Sprintf(
+			"appsrc format=time is-live=true do-timestamp=true name=src ! application/x-rtp, payload=%d, encoding-name=OPUS ! rtpopusdepay ! decodebin ! autoaudiosink",
+			track.PayloadType(),
+		)
+		hasVideoSink = false
 	case "vp9":
-		pipelineString += " ! rtpvp9depay ! decodebin ! autovideosink"
+		pipelineString = "appsrc format=time is-live=true do-timestamp=true name=src ! application/x-rtp ! rtpvp9depay ! decodebin ! videoconvert ! video/x-raw,format=RGB ! jpegenc quality=85 ! appsink name=sink emit-signals=true sync=false"
+		hasVideoSink = true
 	case "h264":
-		pipelineString += " ! rtph264depay ! decodebin ! autovideosink"
+		pipelineString = "appsrc format=time is-live=true do-timestamp=true name=src ! application/x-rtp ! rtph264depay ! decodebin ! videoconvert ! video/x-raw,format=RGB ! jpegenc quality=85 ! appsink name=sink emit-signals=true sync=false"
+		hasVideoSink = true
 	case "g722":
-		pipelineString += " clock-rate=8000 ! rtpg722depay ! decodebin ! autoaudiosink"
+		pipelineString = "appsrc format=time is-live=true do-timestamp=true name=src ! application/x-rtp, clock-rate=8000 ! rtpg722depay ! decodebin ! autoaudiosink"
+		hasVideoSink = false
 	default:
 		panic("Unhandled codec " + codecName)
 	}
+
+	fmt.Printf("GStreamer pipeline: %s\n", pipelineString)
 
 	pipeline, err := gst.NewPipelineFromString(pipelineString)
 	if err != nil {
@@ -365,10 +499,19 @@ func pipelineForCodec(track *webrtc.TrackRemote, codecName string) *app.Source {
 		panic(err)
 	}
 
-	appSrc, err := pipeline.GetElementByName("src")
+	appSrcElem, err := pipeline.GetElementByName("src")
 	if err != nil {
 		panic(err)
 	}
 
-	return app.SrcFromElement(appSrc)
+	var appSink *app.Sink
+	if hasVideoSink {
+		appSinkElem, err := pipeline.GetElementByName("sink")
+		if err != nil {
+			panic(err)
+		}
+		appSink = app.SinkFromElement(appSinkElem)
+	}
+
+	return app.SrcFromElement(appSrcElem), appSink
 }
