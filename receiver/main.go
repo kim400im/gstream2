@@ -8,6 +8,7 @@ package main
 
 import (
 	"encoding/json"
+	"flag"
 	"fmt"
 	"math/rand"
 	"net/http"
@@ -29,6 +30,7 @@ type Message struct {
 	To      string          `json:"to"`
 	Payload json.RawMessage `json:"payload"`
 	Role    string          `json:"role"`
+	RoomID  string          `json:"roomId,omitempty"`
 }
 
 // VideoStats 비디오 통계 정보
@@ -53,6 +55,7 @@ var (
 	ws         *websocket.Conn
 	pc         *webrtc.PeerConnection
 	myID       string
+	roomID     string
 	frameStore = &FrameStore{}
 )
 
@@ -61,6 +64,16 @@ func init() {
 }
 
 func main() {
+	// 커맨드라인 플래그
+	flag.StringVar(&roomID, "room", "", "Room ID to join (required)")
+	flag.Parse()
+
+	if roomID == "" {
+		fmt.Println("Usage: ./receiver -room <room_id>")
+		fmt.Println("Example: ./receiver -room abc123")
+		return
+	}
+
 	// GStreamer 초기화
 	gst.Init(nil)
 
@@ -68,6 +81,7 @@ func main() {
 	myID = fmt.Sprintf("receiver-%d", rand.Intn(10000))
 
 	fmt.Printf("Starting receiver with ID: %s\n", myID)
+	fmt.Printf("Joining room: %s\n", roomID)
 	fmt.Println("Connecting to signaling server at ws://144.24.83.16:8080/ws")
 
 	// HTTP 서버 시작 (MJPEG 스트리밍용)
@@ -92,7 +106,6 @@ func main() {
 	}
 
 	fmt.Println("Registered with signaling server")
-	fmt.Println("Waiting for offer from sender...")
 
 	// WebRTC PeerConnection 초기화
 	initPeerConnection()
@@ -125,7 +138,7 @@ func startHTTPServer() {
 
 // 뷰어 HTML 페이지
 func handleViewer(w http.ResponseWriter, r *http.Request) {
-	html := `<!DOCTYPE html>
+	html := fmt.Sprintf(`<!DOCTYPE html>
 <html>
 <head>
     <title>Receiver Viewer</title>
@@ -141,7 +154,7 @@ func handleViewer(w http.ResponseWriter, r *http.Request) {
         }
         h1 { margin-bottom: 20px; }
         #stream {
-            max-width: 100%;
+            max-width: 100%%;
             border: 2px solid #444;
             border-radius: 8px;
         }
@@ -151,16 +164,23 @@ func handleViewer(w http.ResponseWriter, r *http.Request) {
             background: #333;
             border-radius: 4px;
         }
+        .room-info {
+            background: #2a5298;
+            padding: 10px 20px;
+            border-radius: 4px;
+            margin-bottom: 20px;
+        }
     </style>
 </head>
 <body>
     <h1>Receiver Stream Viewer</h1>
+    <div class="room-info">Room: %s</div>
     <img id="stream" src="/stream" alt="Stream" />
     <div class="status">
         Streaming from GStreamer receiver
     </div>
 </body>
-</html>`
+</html>`, roomID)
 	w.Header().Set("Content-Type", "text/html")
 	w.Write([]byte(html))
 }
@@ -331,12 +351,43 @@ func handleSignalingMessage(msg Message) {
 	switch msg.Type {
 	case "registered":
 		fmt.Println("Successfully registered with server")
+		// 등록 완료 후 방에 입장
+		joinRoom()
+
+	case "room-joined":
+		fmt.Printf("Successfully joined room: %s\n", roomID)
+		fmt.Println("Waiting for offer from sender...")
+
+	case "error":
+		var payload map[string]string
+		json.Unmarshal(msg.Payload, &payload)
+		fmt.Printf("Error: %s\n", payload["message"])
+
+	case "client-list":
+		fmt.Println("Received updated client list")
 
 	case "offer":
 		handleOffer(msg)
 
 	case "ice-candidate":
 		handleICECandidate(msg)
+	}
+}
+
+func joinRoom() {
+	fmt.Printf("Joining room: %s\n", roomID)
+
+	payload, _ := json.Marshal(map[string]string{"roomId": roomID})
+
+	joinMsg := Message{
+		Type:    "join-room",
+		From:    myID,
+		RoomID:  roomID,
+		Payload: payload,
+	}
+
+	if err := ws.WriteJSON(joinMsg); err != nil {
+		fmt.Println("Error joining room:", err)
 	}
 }
 
@@ -433,6 +484,7 @@ func printStats(stats *VideoStats, receiver *webrtc.RTPReceiver) {
 		}
 
 		fmt.Println("\n========== 화질 정보 ==========")
+		fmt.Printf("방: %s\n", roomID)
 		fmt.Printf("코덱: %s\n", stats.codecName)
 		fmt.Printf("프레임레이트: %.2f FPS\n", fps)
 		fmt.Printf("비트레이트: %.2f kbps\n", bitrate)
@@ -451,7 +503,7 @@ func printStats(stats *VideoStats, receiver *webrtc.RTPReceiver) {
 			}
 		}
 
-		fmt.Println("==============================\n")
+		fmt.Println("==============================")
 
 		stats.Unlock()
 	}

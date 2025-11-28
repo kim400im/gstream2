@@ -49,6 +49,19 @@
             background-color: #f8d7da;
             color: #721c24;
         }
+        .room-info {
+            background-color: #cce5ff;
+            color: #004085;
+            padding: 15px;
+            border-radius: 4px;
+            margin: 10px 0;
+        }
+        .room-id {
+            font-size: 24px;
+            font-weight: bold;
+            font-family: monospace;
+            letter-spacing: 2px;
+        }
         .log-entry {
             padding: 5px;
             margin: 2px 0;
@@ -68,6 +81,9 @@
             border-radius: 4px;
             border: 1px solid #ccc;
         }
+        .hidden {
+            display: none;
+        }
     </style>
 </head>
 <body>
@@ -78,12 +94,30 @@
         <div id="status" class="status disconnected">
             Disconnected from signaling server
         </div>
+        <div id="roomStatus" class="status disconnected">
+            No room created
+        </div>
         <div id="peerStatus" class="status disconnected">
             Not connected to receiver
         </div>
     </div>
 
-    <div class="section">
+    <!-- Room Section -->
+    <div class="section" id="roomSection">
+        <h2>Room</h2>
+        <div id="noRoom">
+            <button onclick="createRoom()" id="createRoomBtn">Create Room</button>
+        </div>
+        <div id="roomInfo" class="hidden">
+            <div class="room-info">
+                <p>Room ID:</p>
+                <p class="room-id" id="roomIdDisplay"></p>
+                <p style="margin-top: 10px; font-size: 12px;">Share this ID with receivers to join</p>
+            </div>
+        </div>
+    </div>
+
+    <div class="section" id="mediaSection" class="hidden">
         <h2>Available Receivers</h2>
         <select id="receiverList" size="5" style="width: 100%; min-height: 80px;">
             <option disabled>No receivers available</option>
@@ -92,7 +126,7 @@
 
     <div class="section">
         <h2>Media Controls</h2>
-        <button onclick="startCamera()" id="cameraBtn">Start Camera</button>
+        <button onclick="startCamera()" id="cameraBtn" disabled>Start Camera</button>
         <button onclick="addDisplayCapture()" id="displayBtn" disabled>Add Screen Share</button>
         <button onclick="connectToReceiver()" id="connectBtn" disabled>Connect to Selected Receiver</button>
     </div>
@@ -112,6 +146,7 @@
         let pc;
         let myId = 'sender-' + Math.random().toString(36).substr(2, 9);
         let selectedReceiver = null;
+        let currentRoomId = null;
 
         // WebSocket 연결
         function connectWebSocket() {
@@ -152,6 +187,27 @@
             switch(msg.type) {
                 case 'registered':
                     log('Successfully registered as: ' + myId);
+                    document.getElementById('createRoomBtn').disabled = false;
+                    break;
+
+                case 'room-created':
+                    currentRoomId = msg.payload.roomId;
+                    log('Room created: ' + currentRoomId);
+                    document.getElementById('noRoom').classList.add('hidden');
+                    document.getElementById('roomInfo').classList.remove('hidden');
+                    document.getElementById('roomIdDisplay').textContent = currentRoomId;
+                    document.getElementById('cameraBtn').disabled = false;
+                    updateRoomStatus('connected', currentRoomId);
+                    break;
+
+                case 'room-joined':
+                    currentRoomId = msg.payload.roomId;
+                    log('Joined room: ' + currentRoomId);
+                    break;
+
+                case 'error':
+                    log('Error: ' + msg.payload.message);
+                    alert('Error: ' + msg.payload.message);
                     break;
                     
                 case 'client-list':
@@ -166,6 +222,15 @@
                     handleIceCandidate(msg.payload);
                     break;
             }
+        }
+
+        // 방 생성
+        function createRoom() {
+            log('Creating room...');
+            ws.send(JSON.stringify({
+                type: 'create-room',
+                from: myId
+            }));
         }
 
         // 수신자 목록 업데이트
@@ -345,6 +410,17 @@
             } else {
                 statusDiv.className = 'status disconnected';
                 statusDiv.textContent = 'Disconnected from signaling server';
+            }
+        }
+
+        function updateRoomStatus(status, roomId) {
+            const statusDiv = document.getElementById('roomStatus');
+            if (status === 'connected') {
+                statusDiv.className = 'status connected';
+                statusDiv.textContent = 'Room: ' + roomId;
+            } else {
+                statusDiv.className = 'status disconnected';
+                statusDiv.textContent = 'No room created';
             }
         }
 
